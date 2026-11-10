@@ -52,8 +52,13 @@ Ask before running in live mode: `serve` sends real conversions to Meta and Goog
   platform accepts it or the relay gives up. Never log payloads.
 - Delivery is at-least-once and idempotent on `(event_name, event_id)`. Both platforms deduplicate a resend;
   keep `event_id` (Meta) and `transactionId` (Google) stable across retries.
-- A request the platform rejects as a whole goes back as `isolate`, never `failed`: one bad event must not
-  fail the others. Meta events older than 7 days are failed before sending for the same reason.
+- Anything that clears up on its own or with a configuration fix (outages, rate limits, tokens,
+  permissions) is `retry`, which lasts until 7 days after the event (`RETRY_WINDOW_SECONDS`). A request
+  the platform refuses as a whole goes through `dispatcher.refused`: a batch is split, so one bad event
+  never fails the others. Meta events older than 7 days are failed before sending for the same reason.
+- Day boundaries come from `REPORT_TIMEZONE` (`Settings.tz`) everywhere: dashboard windows, report
+  fetches, the simulator's reports and seeded history.
+- Error text from platform calls can carry the Meta token in a URL; pass it through `meta.redact`.
 - The simulator models documented platform behaviour; when changing a rule, cite the doc in its docstring
   and in README's sandbox section. Its numbers (match rates, latency, failures) are invented and must stay
   deterministic for a seed.

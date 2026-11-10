@@ -77,7 +77,7 @@ class EventIn(_Model):
     event_time: datetime
     action_source: Literal[ACTION_SOURCES] = "website"  # type: ignore[valid-type]
     event_source_url: str | None = Field(None, max_length=2048)
-    value: float | None = Field(None, ge=0)
+    value: float | None = Field(None, ge=0, allow_inf_nan=False)
     currency: str | None = Field(None, min_length=3, max_length=3)
     order_id: str | None = Field(None, max_length=128, description="Google transactionId; defaults to event_id")
     user: User = Field(default_factory=User)

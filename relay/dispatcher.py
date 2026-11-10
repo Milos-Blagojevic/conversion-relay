@@ -20,7 +20,9 @@ from relay.store import Store
 
 log = logging.getLogger("relay.dispatcher")
 
-MAX_ATTEMPTS = 8
+# Keep retrying (backoff doubling from 10 s, capped at 1 h) until this long after the event happened.
+# Meta refuses events older than 7 days anyway, and it bounds how long customer data waits in the queue.
+RETRY_WINDOW_SECONDS = 7 * 86400
 BACKOFF_BASE_SECONDS = 10
 BACKOFF_MAX_SECONDS = 3600
 
@@ -67,6 +69,12 @@ def backoff(attempts: int) -> float:
     return float(min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * 2 ** max(0, attempts - 1)))
 
 
+def refused(count: int, reason: str) -> Outcome:
+    """A request the platform refused as a whole: split a batch to find the bad event; fail a lone one."""
+    return Outcome("isolate", f"batch rejected: {reason}") if count > 1 else Outcome("failed", reason)
+
+
+
 @dataclass
 class Dispatcher:
     """One thread per destination, so a slow or failing platform never delays the other."""
@@ -85,9 +93,10 @@ class Dispatcher:
 
     def run_due(self) -> int:
         """Send everything due now, destination by destination. Returns the number of requests made."""
-        return sum(self._drain(destination) for destination in self.destinations.values())
+        return sum(self.drain(destination) for destination in self.destinations.values())
 
-    def _drain(self, destination: Destination) -> int:
+    def drain(self, destination: Destination) -> int:
+        """Send everything due now to one destination."""
         made = 0
         while not self._stop.is_set():
             rows = self.store.claim_due(destination.name, self.clock.now(), destination.batch_size)
@@ -126,8 +135,12 @@ class Dispatcher:
             elif outcome.status == "isolate":
                 self.store.mark_retry(row["id"], finished, outcome.reason or "batch rejected", solo=True,
                                       count_attempt=False)
-            elif outcome.status == "retry" and row["attempts"] + 1 < MAX_ATTEMPTS:
-                self.store.mark_retry(row["id"], finished + backoff(row["attempts"] + 1), outcome.reason or "retry")
+            elif outcome.status == "retry":
+                reason = outcome.reason or "retry"
+                if finished - row["event_time"] > RETRY_WINDOW_SECONDS:
+                    self.store.mark_failed(row["id"], f"still failing 7 days after the event: {reason}", request_pk)
+                else:
+                    self.store.mark_retry(row["id"], finished + backoff(row["attempts"] + 1), reason)
             else:
                 self.store.mark_failed(row["id"], outcome.reason or "failed", request_pk)
         if accepted:
@@ -157,7 +170,7 @@ class Dispatcher:
             # Clear before draining: an event queued during the drain sets it again and is not missed.
             wake.clear()
             try:
-                self._drain(destination)
+                self.drain(destination)
             except Exception:  # noqa: BLE001 - keep the loop alive; the next pass retries
                 log.exception("%s dispatch pass failed", destination.name)
             wake.wait(self.idle_seconds)

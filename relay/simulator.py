@@ -30,7 +30,7 @@ import random
 import re
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from urllib.parse import parse_qsl, urlencode, urlparse
 
 from relay.clock import Clock
@@ -126,10 +126,6 @@ def meta_match_probability(keys: set[str]) -> float:
     return 1 - miss
 
 
-def _day(ts: float) -> str:
-    return datetime.fromtimestamp(ts, timezone.utc).date().isoformat()
-
-
 def _parse_time(value: str) -> float:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
 
@@ -154,10 +150,15 @@ class Simulator:
         self.clock = clock
         self.meta = settings.meta
         self.google = settings.google
+        # The simulated ad accounts report in the configured time zone, as real ones report in theirs.
+        self.tz = settings.tz
         self._tokens: set[str] = set()
         self._lock = threading.Lock()
         with store.lock:
             store.conn.executescript(SCHEMA)
+
+    def _day(self, ts: float) -> str:
+        return datetime.fromtimestamp(ts, self.tz).date().isoformat()
 
     # Ground truth the demo writes: each order's ad interactions.
 
@@ -366,7 +367,7 @@ class Simulator:
             "SELECT * FROM sim_meta WHERE pixel_id = ? AND event_name = 'Purchase' AND counted = 1 AND matched = 1",
             (self.meta.pixel_id,),
         ):
-            day = _day(row["event_time"])
+            day = self._day(row["event_time"])
             if not since <= day <= until:
                 continue
             touch = _last_touch(journeys.get(row["order_ref"], []), "meta", row["event_time"],
@@ -554,7 +555,7 @@ class Simulator:
         for row in self.store.all(
             "SELECT * FROM sim_google WHERE action_id = ? AND counted = 1 AND matched = 1", (action.group(1),)
         ):
-            day = _day(row["event_time"])
+            day = self._day(row["event_time"])
             if not since <= day <= until:
                 continue
             touch = _last_touch(journeys.get(row["order_ref"], []), "google", row["event_time"],

@@ -2,9 +2,10 @@
 
 import json
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 import responses
-from support import token
+from support import NOW, token
 
 from relay import metrics
 
@@ -49,7 +50,7 @@ def test_meta_quality_and_reported_conversions_are_stored(live, http):
     results = {task: ok for task, ok, _ in live.monitor.refresh()}
     assert results == {"meta_quality": True, "meta_report": True}
 
-    quality = metrics.platform_quality(live.store, 0)["meta"]["events"][0]
+    quality = metrics.platform_quality(live.store, metrics.window(NOW, 7, ZoneInfo("UTC")))["meta"]["events"][0]
     assert (quality["score"], quality["rating"], quality["coverage"]) == (7.4, "Good", 88.0)
     assert quality["keys"] == {"email": 91.0}
     rows = [tuple(r) for r in live.store.all(
@@ -92,3 +93,11 @@ def test_a_failing_platform_call_is_recorded_and_the_others_still_run(live, http
     assert results["meta_quality"] == (False, "Meta 400: Missing permission")
     assert results["meta_report"][0] is True
     assert {r["task"]: r["ok"] for r in live.store.last_monitor_runs()} == {"meta_quality": 0, "meta_report": 1}
+
+
+def test_the_access_token_never_reaches_stored_errors(live, http):
+    live.destinations.pop("google")
+    live.monitor.refresh()  # nothing mocked: the HTTP error text carries the request URL
+    details = [r["detail"] for r in live.store.last_monitor_runs()]
+    assert details and all("meta-token" not in d for d in details)
+    assert any("access_token=[redacted]" in d for d in details)

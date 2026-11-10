@@ -36,6 +36,9 @@ CREATE TABLE IF NOT EXISTS events (
     UNIQUE (event_name, event_id)
 );
 CREATE INDEX IF NOT EXISTS events_time ON events (event_time);
+CREATE INDEX IF NOT EXISTS events_received ON events (received_at);
+-- Google tag beacons join on the transaction id.
+CREATE INDEX IF NOT EXISTS events_tx ON events (event_name, transaction_id);
 
 CREATE TABLE IF NOT EXISTS requests (
     id INTEGER PRIMARY KEY,
@@ -215,7 +218,7 @@ class Store:
     def claim_due(self, destination: str, now: float, limit: int) -> list[sqlite3.Row]:
         """The next batch to send: one isolated (`solo`) delivery, or up to `limit` regular ones."""
         rows = self.all(
-            "SELECT d.id, d.payload, d.attempts, d.solo, e.received_at FROM deliveries d"
+            "SELECT d.id, d.payload, d.attempts, d.solo, e.event_time FROM deliveries d"
             " JOIN events e ON e.id = d.event_pk"
             " WHERE d.destination = ? AND d.status = 'pending' AND d.next_attempt_at <= ?"
             " ORDER BY d.solo DESC, d.next_attempt_at, d.id LIMIT ?",

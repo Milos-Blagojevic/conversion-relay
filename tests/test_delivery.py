@@ -8,7 +8,7 @@ import responses
 from support import GOOGLE, GOOGLE_INGEST, GOOGLE_STATUS, META_EVENTS, NOW, event, token
 
 from relay import config, runtime
-from relay.dispatcher import MAX_ATTEMPTS
+from relay.dispatcher import RETRY_WINDOW_SECONDS
 from relay.runtime import InvalidEvent
 
 
@@ -146,24 +146,55 @@ def test_events_older_than_seven_days_fail_without_sinking_the_request(live, htt
     assert live.store.scalar("SELECT reason FROM deliveries WHERE status = 'failed'") == "event_time older than 7 days"
 
 
-def test_a_bad_token_keeps_events_queued_instead_of_dropping_them(live, http):
+def drive(relay, clock, hours: int) -> None:
+    """Let the dispatcher retry for `hours` of simulated time."""
+    for _ in range(hours):
+        relay.dispatcher.run_due()
+        clock.sleep(3600)
+
+
+def test_a_bad_token_keeps_events_queued_until_the_credentials_are_fixed(live, http, clock):
     live.destinations.pop("google")
     http.add(responses.POST, META_EVENTS, status=400, json={"error": {"message": "Invalid OAuth access token", "code": 190}})
     live.ingest(event())
-    live.dispatcher.run_due()
+    drive(live, clock, 24)
     row = deliveries(live)["meta"]
     assert row["status"] == "pending" and "auth" in row["reason"]
 
+    http.replace(responses.POST, META_EVENTS, json={"events_received": 1})
+    drive(live, clock, 1)
+    assert deliveries(live)["meta"]["status"] == "sent"
 
-def test_retries_stop_after_the_last_attempt(live, http, clock):
+
+def test_a_token_not_assigned_to_the_pixel_waits_for_the_fix_too(live, http):
     live.destinations.pop("google")
-    http.add(responses.POST, META_EVENTS, status=503, json={"error": {"message": "down"}})
+    missing = "Object with ID '111' does not exist, cannot be loaded due to missing permissions"
+    http.add(responses.POST, META_EVENTS, status=400, json={"error": {"message": missing, "code": 100, "error_subcode": 33}})
+    live.ingest(event(event_id="a"))
+    live.ingest(event(event_id="b"))
+    live.dispatcher.run_due()
+    assert [r["status"] for r in live.store.all("SELECT status FROM deliveries")] == ["pending", "pending"]
+
+
+def test_retries_end_seven_days_after_the_event_and_drop_the_payload(live, http, clock):
+    live.destinations.pop("meta")
+    token(http)
+    http.add(responses.POST, GOOGLE_INGEST, status=503, json={"error": {"message": "down"}})
     live.ingest(event())
-    for _ in range(MAX_ATTEMPTS):
-        live.dispatcher.run_due()
-        clock.sleep(3600)
-    row = deliveries(live)["meta"]
-    assert (row["status"], row["attempts"]) == ("failed", MAX_ATTEMPTS)
+    window_hours = RETRY_WINDOW_SECONDS // 3600
+    drive(live, clock, window_hours - 24)
+    assert deliveries(live)["google"]["status"] == "pending", "an outage of days does not lose the event"
+    drive(live, clock, 48)
+    row = deliveries(live)["google"]
+    assert row["status"] == "failed" and row["reason"] == "still failing 7 days after the event: google 503: down"
+    assert row["payload"] is None
+
+
+def test_meta_skips_events_it_would_reject(live):
+    assert live.ingest(event(event_id="u", event_source_url=None)).deliveries["meta"] == "skipped"
+    assert live.ingest(event(event_id="a", action_source="app")).deliveries["meta"] == "skipped"
+    reasons = {r["reason"] for r in live.store.all("SELECT reason FROM deliveries WHERE destination = 'meta'")}
+    assert reasons == {"website event without event_source_url", "app events are not supported"}
 
 
 def test_an_expired_google_token_is_refreshed_and_the_event_retried(live, http, clock):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 MODES = ("live", "sandbox")
 
@@ -57,10 +58,16 @@ class Settings:
     report_days: int = 30
     # The event the attribution comparison counts (internal orders against platform conversions).
     conversion_event: str = "Purchase"
+    # The ad accounts' time zone: Meta and Google date their reports in it, so the relay's days follow it.
+    report_timezone: str = "UTC"
 
     @property
     def sandbox(self) -> bool:
         return self.mode == "sandbox"
+
+    @property
+    def tz(self) -> ZoneInfo:
+        return ZoneInfo(self.report_timezone)
 
 
 # Placeholder accounts for sandbox mode. Requests to them never leave the process: sandbox mode
@@ -175,10 +182,19 @@ def from_env(env: Mapping[str, str] | None = None) -> Settings:
         click_lookback_days=_int(env, "CLICK_LOOKBACK_DAYS", 7),
         report_days=_int(env, "REPORT_DAYS", 30),
         conversion_event=_get(env, "CONVERSION_EVENT") or "Purchase",
+        report_timezone=_timezone(_get(env, "REPORT_TIMEZONE") or "UTC"),
     )
     if mode == "sandbox":
         return as_sandbox(settings)
     return replace(settings, meta=_meta(env), google=_google(env))
+
+
+def _timezone(name: str) -> str:
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise ConfigError(f"REPORT_TIMEZONE must be an IANA time zone such as Europe/Belgrade, got {name!r}") from None
+    return name
 
 
 def as_sandbox(settings: Settings) -> Settings:

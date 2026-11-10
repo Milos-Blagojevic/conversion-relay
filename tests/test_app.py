@@ -1,6 +1,7 @@
 """The HTTP surface: access rules, intake responses, dashboard and demo pages."""
 
 import base64
+import json
 from dataclasses import replace
 
 import pytest
@@ -47,9 +48,15 @@ def test_batch_reports_each_event(live):
 
 
 def test_invalid_events_are_refused_with_the_reason(live):
-    response = client(live).post("/v1/events", json=payload() | {"currency": "dollars"})
+    c = client(live)
+    response = c.post("/v1/events", json=payload() | {"currency": "dollars"})
     assert response.status_code == 422
     assert response.json()["detail"][0]["loc"] == ["body", "currency"]
+    # An infinite value would make the platform request unserialisable and stall the whole batch.
+    body = json.dumps(payload()).replace('"value": 49.0', '"value": 1e999')
+    response = c.post("/v1/events", content=body, headers={"Content-Type": "application/json"})
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "value"]
 
 
 def test_beacons_are_public_and_recorded(live):
@@ -66,10 +73,13 @@ def test_dashboard_needs_the_password_when_one_is_set(live):
     assert c.get("/", headers=basic("pw")).status_code == 200
 
 
-def test_without_a_password_only_loopback_hosts_are_served(live):
+def test_without_secrets_only_loopback_hosts_are_served(live):
     c = client(live)
     assert c.get("/").status_code == 200
     assert c.get("/", headers={"Host": "relay.example.com"}).status_code == 403
+    # Without RELAY_API_KEY a page elsewhere could post fake conversions through DNS rebinding.
+    assert c.post("/v1/events", json=payload(), headers={"Host": "relay.example.com"}).status_code == 403
+    assert c.post("/v1/events", json=payload(), headers={"Host": "localhost:8000"}).status_code == 202
 
 
 def test_cross_origin_posts_to_the_dashboard_are_refused(live):

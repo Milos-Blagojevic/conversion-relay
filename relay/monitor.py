@@ -12,11 +12,11 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from relay.clock import Clock
 from relay.config import Settings
-from relay.google import TERMINAL_STATUSES, GoogleDestination
+from relay.google import ALREADY_RECORDED, TERMINAL_STATUSES, GoogleDestination
 from relay.meta import MetaDestination
 from relay.store import Store
 from relay.transport import PlatformError
@@ -75,7 +75,8 @@ class Monitor:
         return f"{len(data['events'])} event name(s)"
 
     def _report(self, platform: str, destination) -> str:
-        until = datetime.fromtimestamp(self.clock.now(), timezone.utc).date()
+        # Report days are the ad account's days; REPORT_TIMEZONE says which zone that is.
+        until = datetime.fromtimestamp(self.clock.now(), self.settings.tz).date()
         since = until - timedelta(days=self.settings.report_days - 1)
         rows = destination.fetch_report(since, until)
         self.store.replace_reports(platform, since.isoformat(), until.isoformat(), rows, self.clock.now())
@@ -98,6 +99,8 @@ class Monitor:
                 finished += 1
                 self.store.update_request_status(request["id"], status, diagnostics, self.clock.now())
                 for error in diagnostics["errors"]:
+                    if error["reason"] in ALREADY_RECORDED:
+                        continue  # a resend Google already had: the conversion is there
                     indices = error["indices"]
                     if not indices and status == "FAILED":
                         indices = list(range(request["event_count"]))

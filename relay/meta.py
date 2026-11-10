@@ -7,13 +7,14 @@ Dataset Quality API: https://developers.facebook.com/docs/marketing-api/conversi
 from __future__ import annotations
 
 import json
+import re
 from datetime import date
 
 import requests
 
 from relay.clock import Clock
 from relay.config import MetaSettings
-from relay.dispatcher import Outcome, SendResult, Skip
+from relay.dispatcher import Outcome, SendResult, Skip, refused
 from relay.models import EventIn
 from relay.normalize import Prepared
 from relay.transport import PlatformError, Transport, body
@@ -25,6 +26,16 @@ MAX_EVENT_AGE_SECONDS = 7 * 86400 - 600
 TRANSIENT_CODES = frozenset({1, 2, 4, 17, 32, 341, 368, 613, 80004})
 # Token or permission problems: fixing the configuration should let the queued events through.
 AUTH_CODES = frozenset({10, 102, 190, *range(200, 300)})
+# Code 100 subcode 33: "object does not exist, cannot be loaded due to missing permissions", which is
+# what a token not assigned to the pixel gets.
+AUTH_SUBCODES = frozenset({33})
+_TOKEN = re.compile(r"(access_token=)[^&\s'\"]+")
+
+
+def redact(text: str) -> str:
+    """Monitoring URLs carry the access token; keep it out of error text, the database and the page."""
+    return _TOKEN.sub(r"\1[redacted]", text)
+
 
 QUALITY_FIELDS = (
     "web{event_name,"
@@ -58,6 +69,11 @@ class MetaDestination:
         if event.action_source == "website" and not prepared.user_agent:
             # Meta rejects website events without client_user_agent (and with it the whole batch).
             return Skip("website event without user agent")
+        if event.action_source == "website" and not event.event_source_url:
+            return Skip("website event without event_source_url")
+        if event.action_source == "app":
+            # App events need app_data (device and app details), which this relay does not collect.
+            return Skip("app events are not supported")
         payload: dict = {
             "event_name": event.event_name,
             "event_time": int(event.event_time.timestamp()),
@@ -89,8 +105,11 @@ class MetaDestination:
             request["test_event_code"] = self.settings.test_event_code
         try:
             response = self.transport.request("POST", self._url(f"{self.settings.pixel_id}/events"), json=request)
+        except requests.exceptions.InvalidJSONError as exc:
+            # Something in an event can not be sent as JSON: find it, do not retry the batch forever.
+            return _fill(outcomes, fresh, refused(len(fresh), f"not JSON-serialisable: {exc}"), None, str(exc))
         except requests.RequestException as exc:
-            return _fill(outcomes, fresh, Outcome("retry", f"network: {exc}"), None, str(exc))
+            return _fill(outcomes, fresh, Outcome("retry", f"network: {redact(str(exc))}"), None, redact(str(exc)))
         data = body(response)
         if response.status_code == 200:
             result = _fill(outcomes, fresh, Outcome("sent"), 200, None)
@@ -103,12 +122,10 @@ class MetaDestination:
             "is_transient"
         ):
             outcome = Outcome("retry", f"meta {response.status_code}: {message}")
-        elif code in AUTH_CODES:
+        elif code in AUTH_CODES or error.get("error_subcode") in AUTH_SUBCODES:
             outcome = Outcome("retry", f"meta auth/permission ({code}): {message}")
-        elif len(fresh) > 1:
-            outcome = Outcome("isolate", f"batch rejected: {message}")
         else:
-            outcome = Outcome("failed", f"meta {response.status_code}: {message}")
+            outcome = refused(len(fresh), f"meta {response.status_code}: {message}")
         result = _fill(outcomes, fresh, outcome, response.status_code, message)
         result.platform_ref = error.get("fbtrace_id")
         return result
@@ -119,11 +136,12 @@ class MetaDestination:
         try:
             response = self.transport.request("GET", url, params=params)
         except requests.RequestException as exc:
-            raise PlatformError(f"Meta: {exc}") from exc
+            raise PlatformError(f"Meta: {redact(str(exc))}") from exc
         data = body(response)
         if response.status_code != 200:
             error = data.get("error", {}) if isinstance(data, dict) else {}
-            raise PlatformError(f"Meta {response.status_code}: {error.get('message') or response.text[:300]}")
+            detail = error.get("message") or response.text[:300]
+            raise PlatformError(f"Meta {response.status_code}: {redact(detail)}")
         return data
 
     def fetch_quality(self) -> dict:

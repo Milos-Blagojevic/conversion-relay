@@ -19,6 +19,7 @@ from typing import Literal
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -95,10 +96,13 @@ def create_app(relay: Relay, start_background: bool = True) -> FastAPI:
         if path in PUBLIC_PATHS or request.method == "OPTIONS" and path.startswith("/v1/"):
             return await call_next(request)
         if path.startswith(SERVER_PATHS):
-            if settings.api_key and not hmac.compare_digest(
-                request.headers.get("authorization", "").encode(), f"Bearer {settings.api_key}".encode()
-            ):
-                return JSONResponse({"detail": "missing or wrong API key"}, status_code=401)
+            if settings.api_key:
+                if not hmac.compare_digest(
+                    request.headers.get("authorization", "").encode(), f"Bearer {settings.api_key}".encode()
+                ):
+                    return JSONResponse({"detail": "missing or wrong API key"}, status_code=401)
+            elif _host(request) not in LOOPBACK:
+                return JSONResponse({"detail": "set RELAY_API_KEY to accept events beyond localhost"}, status_code=403)
             return await call_next(request)
         if settings.dashboard_password:
             if not _basic_ok(request.headers.get("authorization", ""), settings.dashboard_password):
@@ -117,6 +121,13 @@ def create_app(relay: Relay, start_background: bool = True) -> FastAPI:
         allow_headers=["Content-Type"],
     )
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request: Request, exc: RequestValidationError) -> JSONResponse:
+        # FastAPI's default echoes each bad input back, which fails on values JSON can not hold (inf)
+        # and repeats customer data; location and message are enough.
+        errors = [{"loc": e["loc"], "msg": e["msg"], "type": e["type"]} for e in exc.errors()]
+        return JSONResponse({"detail": errors}, status_code=422)
 
     # Intake
 

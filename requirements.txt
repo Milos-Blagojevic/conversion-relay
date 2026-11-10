@@ -5,3 +5,4 @@ phonenumbers==9.0.43
 pydantic==2.14.3
 requests==2.34.2
 uvicorn==0.54.0
+tzdata==2026.6

@@ -86,6 +86,8 @@ def test_google_reports_a_repeated_transaction_id_as_a_processing_error(sandbox,
         for e in json.loads(row["diagnostics"])["errors"]
     ]
     assert reasons == ["PROCESSING_ERROR_REASON_DUPLICATE_TRANSACTION_ID"]
+    # Google already has that conversion, so the resend counts as delivered, not rejected.
+    assert sandbox.store.scalar("SELECT status FROM deliveries WHERE destination = 'google'") == "sent"
 
 
 def test_platforms_credit_their_own_last_touch_so_both_claim_one_order(sandbox):

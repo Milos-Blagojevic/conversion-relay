@@ -4,7 +4,7 @@
 {% block main %}
 <div class="page-head">
   <h1>Events</h1>
-  <span class="muted small">latest {{ rows | length }} · times in UTC · customer data is stored hashed and dropped once sent</span>
+  <span class="muted small">latest {{ rows | length }} · times in UTC · customer data is never stored; hashes wait in the queue only until the platform accepts them</span>
 </div>
 <div class="card">
   <table>

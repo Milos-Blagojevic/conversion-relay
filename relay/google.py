@@ -20,7 +20,7 @@ import requests
 
 from relay.clock import Clock
 from relay.config import GoogleSettings
-from relay.dispatcher import Outcome, SendResult, Skip
+from relay.dispatcher import Outcome, SendResult, Skip, refused
 from relay.models import EventIn
 from relay.normalize import Prepared
 from relay.transport import PlatformError, Transport, body
@@ -28,6 +28,8 @@ from relay.transport import PlatformError, Transport, body
 NAME = "google"
 EVENT_SOURCES = {"website": "WEB", "app": "APP"}
 TERMINAL_STATUSES = frozenset({"SUCCESS", "PARTIAL_SUCCESS", "FAILED"})
+# Processing errors that mean Google already holds the conversion (a resend after a timeout).
+ALREADY_RECORDED = frozenset({"PROCESSING_ERROR_REASON_DUPLICATE_TRANSACTION_ID"})
 
 
 class TokenSource:
@@ -160,6 +162,9 @@ class GoogleDestination:
             response = self.transport.request(
                 "POST", f"{self.settings.datamanager_url}/v1/events:ingest", json=request, headers=headers
             )
+        except requests.exceptions.InvalidJSONError as exc:
+            # Something in an event can not be sent as JSON: find it, do not retry the batch forever.
+            return SendResult(None, [refused(count, f"not JSON-serialisable: {exc}")] * count, error=str(exc))
         except requests.RequestException as exc:
             return SendResult(None, [Outcome("retry", f"network: {exc}")] * count, error=str(exc))
         data = body(response)
@@ -175,10 +180,8 @@ class GoogleDestination:
             outcome = Outcome("retry", f"google 401: {message}")
         elif status in (403, 429) or status >= 500:
             outcome = Outcome("retry", f"google {status}: {message}")
-        elif count > 1:
-            outcome = Outcome("isolate", f"batch rejected: {message}")
         else:
-            outcome = Outcome("failed", f"google {status}: {message}")
+            outcome = refused(count, f"google {status}: {message}")
         return SendResult(status, [outcome] * count, error=message)
 
     # Monitoring

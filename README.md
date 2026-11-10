@@ -153,17 +153,24 @@ meanwhile.
 
 **Deploying.** The `Dockerfile` runs `python -m relay serve --host 0.0.0.0` on `$PORT`. Mount a volume
 and set `RELAY_DB=/data/relay.db`. Serving beyond localhost requires `RELAY_API_KEY` and
-`DASHBOARD_PASSWORD`. Run one instance per database: the dispatcher threads live in the process.
+`DASHBOARD_PASSWORD`. Without them the relay only answers requests addressed to localhost, judged by the
+`Host` header, so behind a reverse proxy set both even when the relay itself listens on 127.0.0.1. Run
+one instance per database: the dispatcher threads live in the process.
+
+Set `REPORT_TIMEZONE` to the ad accounts' time zone (Meta: ad account settings; Google Ads: account
+settings). The platforms date their reports in it, and the dashboard counts the relay's own days in it
+too, so the daily comparison lines up.
 
 ## The dashboard
 
-`/` (window of 1, 7, 14 or 30 days), `/events` (latest events with per-destination status, latency
-and match keys), `/api/metrics?days=7` (the same numbers as JSON), `/docs` (OpenAPI). "Refresh
-platform data" pulls from the platforms now; the monitor also does it every `MONITOR_INTERVAL_SECONDS`.
+`/` (the last 1, 7, 14 or 30 calendar days in `REPORT_TIMEZONE`, today included), `/events` (latest
+events with per-destination status, latency and match keys), `/api/metrics?days=7` (the same numbers
+as JSON), `/docs` (OpenAPI). "Refresh platform data" pulls from the platforms now; the monitor also
+does it every `MONITOR_INTERVAL_SECONDS`.
 
 | Panel | Numbers | Source |
 |---|---|---|
-| Deduplication | Tag fired, server events, matched pairs, server only (conversions the browser lost and the server recovered), tag only (keys that matched nothing: double counts), daily key match rate | Beacons joined to events on `event_id` (Meta) and `transaction_id` (Google) |
+| Deduplication | Tag fired, server events, matched pairs, server only (no tag fired: conversions the browser lost and the server recovered; orders with refused consent are left out), tag only (keys that matched nothing: double counts, or a server event still to come), daily key match rate | Beacons joined to events on `event_id` (Meta) and `transaction_id` (Google) |
 | | Meta's dedup keys: share of browser and server events carrying `event_id`/`fbp`/`external_id`, and browser events deduplicated through each; event coverage | Meta Dataset Quality API |
 | Event match quality | Meta EMQ (0-10) and rating per event, key coverage as Meta sees it, diagnostics, data freshness, share over 2 h late, additional conversions reported | Meta Dataset Quality API (last 7 days) |
 | | Relay estimate per event and per day: a weighted score of the keys sent (email and phone first, then click id, external id, browser id, IP and user agent, name and address). A heuristic for early warning, not Meta's formula | Relay |
@@ -178,25 +185,28 @@ every conversion it can match to its own last click or view in its own window, s
 Google's numbers overlap and their sum can exceed the orders.
 
 Delivery statuses: `pending` (queued or waiting for a retry), `sent` (accepted), `validated`
-(Google validate-only), `failed` (gave up: rejected request, event too old for Meta, or 8 attempts),
-`rejected` (Google accepted the request, then failed the record in processing), `skipped` (refused
-consent, no identifiers, or a website event without a user agent).
+(Google validate-only), `failed` (gave up: the platform refused the event, it was too old for Meta, or
+it was still failing 7 days after it happened), `rejected` (Google accepted the request, then failed the
+record in processing; a repeated transaction ID is not counted, since Google already has that
+conversion), `skipped` (refused consent, no identifiers; for Meta also a website event without a user
+agent or `event_source_url`, and app events, which need device data the relay does not take).
 
 ## How delivery works
 
 - **Idempotent intake.** `(event_name, event_id)` is unique; a repeat is counted (`duplicate_hits`) and dropped.
 - **Batching and retries.** One dispatcher thread per platform (a slow or failing platform never delays
   the other) sends what is due in batches of up to 500, at once after each event. 5xx, 429, network
-  errors and Meta's transient codes retry with backoff
-  (10 s doubling, 1 h cap, 8 attempts); token and permission errors also retry, so fixing the
-  credentials lets the queue through. A request rejected as a whole (one bad event) is split and each
-  event retried alone. Meta events older than 7 days are failed before sending, since one would sink
-  the whole request.
+  errors, Meta's transient codes and token or permission errors (including a token not assigned to the
+  pixel) retry with backoff, 10 s doubling up to 1 h, until 7 days after the event: an outage or an
+  expired token of hours or days loses nothing once it is fixed. A request refused as a whole (one bad
+  event) is split and each event sent alone, so only the bad one fails. Meta events older than 7 days
+  are failed before sending, since one would sink the whole request.
 - **At-least-once.** A crash between sending and recording resends the batch; Meta drops the repeat on
   `event_id`, Google on `transactionId`.
 - **Privacy.** Raw customer data is never stored. Events keep only which keys were present; the payload
-  (hashes, IP, user agent) lives in the delivery row until the platform accepts it or the relay gives up,
-  then it is deleted.
+  (hashes, IP, user agent) lives in the delivery row until the platform accepts it or the relay gives up
+  (at most 7 days after the event), then it is deleted. Monitoring errors are stored with the Meta
+  access token redacted.
 
 ## The sandbox model
 

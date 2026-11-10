@@ -20,7 +20,7 @@ import threading
 import uuid
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 
 from relay.clock import ManualClock
 from relay.models import EventIn
@@ -250,8 +250,9 @@ def seed(relay: Relay, *, days: int = 14, orders_per_day: int = 60, broken_days:
     rng = random.Random(seed)
     clock = relay.clock
     end = end if end is not None else clock.now()
-    start_day = datetime.fromtimestamp(end, timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(
-        days=days - 1
+    # Days start at midnight in the report time zone, like the platform reports and the dashboard.
+    start_day = datetime.combine(
+        datetime.fromtimestamp(end, relay.settings.tz).date() - timedelta(days=days - 1), time(), relay.settings.tz
     )
     timeline: list[tuple[float, int, str, Order]] = []
     orders = 0
@@ -278,17 +279,28 @@ def seed(relay: Relay, *, days: int = 14, orders_per_day: int = 60, broken_days:
             fire_tags(relay, order)
         else:
             relay.ingest(server_event(order))
-            relay.dispatcher.run_due()
+            _deliver(relay, clock)
     _advance(relay, clock, end)
     monitor = relay.monitor.refresh()
     return {"orders": orders, "events": relay.store.scalar("SELECT COUNT(*) FROM events"), "monitor": monitor}
 
 
+def _deliver(relay: Relay, clock: ManualClock) -> None:
+    """Send what is due to each platform from the same moment, as the per-platform threads do,
+    so one platform's simulated latency does not count against the other."""
+    start = finish = clock.now()
+    for destination in relay.destinations.values():
+        clock.set(start)
+        relay.dispatcher.drain(destination)
+        finish = max(finish, clock.now())
+    clock.set(finish)
+
+
 def _advance(relay: Relay, clock: ManualClock, until: float) -> None:
-    """Move the clock to `until`, sending each retry when it falls due, as the dispatcher thread would."""
+    """Move the clock to `until`, sending each retry when it falls due, as the dispatcher threads would."""
     while (due := relay.store.next_due()) is not None and due <= until:
         clock.set(max(due, clock.now()))
-        relay.dispatcher.run_due()
+        _deliver(relay, clock)
     clock.set(max(until, clock.now()))
 
 

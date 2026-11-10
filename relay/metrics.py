@@ -1,22 +1,24 @@
 """The numbers on the dashboard (and in `python -m relay report`), computed from the store.
 
-Operational sections (delivery, latency, coverage, match quality) use a rolling window on when the
-relay received each event. The attribution comparison uses whole UTC days on when each conversion
-happened, because that is how the platform reports are dated.
+Every section covers the same window: whole calendar days in the report time zone, today included,
+because that is how Meta and Google date their reports. Operational sections (delivery, latency,
+coverage, match quality) place an event on the day the relay received it; the attribution comparison
+on the day the conversion happened.
 """
 
 from __future__ import annotations
 
 import json
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime, time, timedelta, tzinfo
 
 from relay import quality
 from relay.attribution import CHANNELS
 from relay.config import Settings
+from relay.google import ALREADY_RECORDED
 from relay.store import Store
 
-DAY = 86400
 TAG_JOIN = {"meta_pixel": "event_id", "google_tag": "transaction_id"}
 
 
@@ -35,37 +37,47 @@ def percentile(values: list[float], q: float) -> float | None:
     return round(ordered[low] + (ordered[high] - ordered[low]) * (position - low), 1)
 
 
-def _day(ts: float) -> str:
-    return datetime.fromtimestamp(ts, timezone.utc).date().isoformat()
+@dataclass(frozen=True)
+class Window:
+    tz: tzinfo
+    days: list[str]
+    start: float
+
+    def day(self, ts: float) -> str:
+        return datetime.fromtimestamp(ts, self.tz).date().isoformat()
 
 
-def _days(now: float, days: int) -> list[str]:
-    last = datetime.fromtimestamp(now, timezone.utc).date()
-    return [(last - timedelta(days=offset)).isoformat() for offset in range(days - 1, -1, -1)]
+def window(now: float, days: int, tz: tzinfo) -> Window:
+    """The last `days` calendar days in `tz`, today included, starting at the first day's midnight."""
+    today = datetime.fromtimestamp(now, tz).date()
+    first = today - timedelta(days=days - 1)
+    day_list = [(first + timedelta(days=offset)).isoformat() for offset in range(days)]
+    return Window(tz, day_list, datetime.combine(first, time(), tz).timestamp())
 
 
 def collect(store: Store, settings: Settings, destinations: list[str], now: float, days: int) -> dict:
-    start = now - days * DAY
+    w = window(now, days, settings.tz)
     return {
         "generated_at": now,
         "days": days,
+        "timezone": settings.report_timezone,
         "mode": settings.mode,
         "destinations": destinations,
-        "totals": totals(store, start),
-        "delivery": delivery(store, start, destinations),
-        "latency": latency(store, start, now, days, destinations),
-        "coverage": coverage(store, start, now, days),
-        "quality": match_quality(store, start, now, days),
-        "platform_quality": platform_quality(store, start),
-        "attribution": attribution(store, settings.conversion_event, now, days),
+        "totals": totals(store, w),
+        "delivery": delivery(store, w, destinations),
+        "latency": latency(store, w, destinations),
+        "coverage": coverage(store, w),
+        "quality": match_quality(store, w),
+        "platform_quality": platform_quality(store, w),
+        "attribution": attribution(store, settings.conversion_event, w),
         "monitor": [dict(row) for row in store.last_monitor_runs()],
     }
 
 
-def totals(store: Store, start: float) -> dict:
+def totals(store: Store, w: Window) -> dict:
     row = store.one(
         "SELECT COUNT(*) AS events, COALESCE(SUM(duplicate_hits), 0) AS duplicates FROM events WHERE received_at >= ?",
-        (start,),
+        (w.start,),
     )
     return {
         "events": row["events"],
@@ -74,19 +86,18 @@ def totals(store: Store, start: float) -> dict:
     }
 
 
-def delivery(store: Store, start: float, destinations: list[str]) -> dict:
+def delivery(store: Store, w: Window, destinations: list[str]) -> dict:
     """Per destination: how many events ended in each status, and why the unsent ones were not sent."""
-    out: dict[str, dict] = {
-        name: {"total": 0, "statuses": Counter(), "reasons": Counter(), "retried": 0} for name in destinations
-    }
+    def blank() -> dict:
+        return {"total": 0, "statuses": Counter(), "reasons": Counter(), "retried": 0}
+
+    out: dict[str, dict] = {name: blank() for name in destinations}
     for row in store.all(
         "SELECT d.destination, d.status, d.reason, COUNT(*) AS n, SUM(d.attempts > 1) AS retried FROM deliveries d"
         " JOIN events e ON e.id = d.event_pk WHERE e.received_at >= ? GROUP BY 1, 2, 3",
-        (start,),
+        (w.start,),
     ):
-        entry = out.setdefault(
-            row["destination"], {"total": 0, "statuses": Counter(), "reasons": Counter(), "retried": 0}
-        )
+        entry = out.setdefault(row["destination"], blank())
         entry["total"] += row["n"]
         entry["statuses"][row["status"]] += row["n"]
         entry["retried"] += row["retried"] or 0
@@ -104,17 +115,16 @@ def delivery(store: Store, start: float, destinations: list[str]) -> dict:
     return out
 
 
-def latency(store: Store, start: float, now: float, days: int, destinations: list[str]) -> dict:
+def latency(store: Store, w: Window, destinations: list[str]) -> dict:
     """Received-to-accepted time per delivery (queueing, retries and the API call), the API call alone,
     and the event age at delivery (what Meta's data freshness and event delay measure)."""
     rows = store.all(
         "SELECT d.destination, (d.sent_at - e.received_at) * 1000 AS ms, d.sent_at - e.event_time AS age,"
         " d.sent_at FROM deliveries d JOIN events e ON e.id = d.event_pk"
         " WHERE d.status IN ('sent', 'validated', 'rejected') AND d.sent_at >= ?",
-        (start,),
+        (w.start,),
     )
-    requests = store.all("SELECT destination, duration_ms, ok FROM requests WHERE started_at >= ?", (start,))
-    day_list = _days(now, days)
+    requests = store.all("SELECT destination, duration_ms, ok FROM requests WHERE started_at >= ?", (w.start,))
     out = {}
     for name in destinations:
         mine = [r for r in rows if r["destination"] == name]
@@ -123,7 +133,7 @@ def latency(store: Store, start: float, now: float, days: int, destinations: lis
         ages = [r["age"] for r in mine]
         by_day: dict[str, list[float]] = defaultdict(list)
         for r in mine:
-            by_day[_day(r["sent_at"])].append(r["ms"])
+            by_day[w.day(r["sent_at"])].append(r["ms"])
         out[name] = {
             "delivered": len(mine),
             "p50_ms": percentile(ms, 50),
@@ -135,29 +145,29 @@ def latency(store: Store, start: float, now: float, days: int, destinations: lis
             "requests": len(calls),
             "request_error_rate": pct(sum(1 for c in calls if not c["ok"]), len(calls)),
             "over_2h": pct(sum(1 for a in ages if a > 2 * 3600), len(ages)),
-            "over_24h": pct(sum(1 for a in ages if a > DAY), len(ages)),
+            "over_24h": pct(sum(1 for a in ages if a > 86400), len(ages)),
             "daily": [
                 {"day": day, "p50_ms": percentile(by_day[day], 50), "p95_ms": percentile(by_day[day], 95)}
-                for day in day_list
+                for day in w.days
             ],
         }
     return out
 
 
-def coverage(store: Store, start: float, now: float, days: int) -> dict:
+def coverage(store: Store, w: Window) -> dict:
     """Browser tags against server events, from the beacons the page sends when its tags fire.
 
     both: the tag fired and the relay got the server event with the same dedup key (the platform
-    deduplicates them). server_only: no tag, so the server event is a conversion the browser lost.
-    browser_only: a tag whose dedup key matches no server event, so the platform counts it apart from
-    the server event and the order is counted twice (or the server never sent it)."""
+    deduplicates them). server_only: no tag fired, so the server event is a conversion the browser
+    lost. browser_only: a tag whose dedup key matches no server event, so the platform counts it apart
+    from the server event and the order is counted twice (or the server has not sent it yet).
+    Events whose visitor refused consent are left out: neither side sends them."""
     out = {}
-    day_list = _days(now, days)
     for tag, column in TAG_JOIN.items():
         beacons = store.all(
             f"SELECT b.received_at, b.event_name, e.id AS event_pk FROM beacons b LEFT JOIN events e"
             f" ON e.event_name = b.event_name AND e.{column} = b.event_id WHERE b.tag = ? AND b.received_at >= ?",
-            (tag, start),
+            (tag, w.start),
         )
         if not beacons:
             out[tag] = None
@@ -165,13 +175,15 @@ def coverage(store: Store, start: float, now: float, days: int) -> dict:
         names = sorted({b["event_name"] for b in beacons})
         marks = ",".join("?" for _ in names)
         server = store.scalar(
-            f"SELECT COUNT(*) FROM events WHERE received_at >= ? AND event_name IN ({marks})", (start, *names)
+            f"SELECT COUNT(*) FROM events WHERE received_at >= ? AND event_name IN ({marks})"
+            " AND consent_ad_user_data IS NOT 0",
+            (w.start, *names),
         )
         both = len({b["event_pk"] for b in beacons if b["event_pk"] is not None})
         matched_beacons = sum(1 for b in beacons if b["event_pk"] is not None)
         per_day: dict[str, list[int]] = defaultdict(lambda: [0, 0])
         for b in beacons:
-            entry = per_day[_day(b["received_at"])]
+            entry = per_day[w.day(b["received_at"])]
             entry[0] += 1
             entry[1] += b["event_pk"] is not None
         out[tag] = {
@@ -184,23 +196,23 @@ def coverage(store: Store, start: float, now: float, days: int) -> dict:
             "server_recovered": pct(server - both, server),
             "daily_key_match": [
                 {"day": day, "rate": pct(per_day[day][1], per_day[day][0]) if day in per_day else None}
-                for day in day_list
+                for day in w.days
             ],
         }
     return out
 
 
-def match_quality(store: Store, start: float, now: float, days: int) -> dict:
+def match_quality(store: Store, w: Window) -> dict:
     """The relay's view: which match keys each destination got, and the estimated Meta score."""
     meta_rows = store.all(
         "SELECT e.meta_keys, e.meta_score, e.received_at FROM events e JOIN deliveries d ON d.event_pk = e.id"
         " AND d.destination = 'meta' AND d.status != 'skipped' WHERE e.received_at >= ?",
-        (start,),
+        (w.start,),
     )
     google_rows = store.all(
         "SELECT e.google_keys FROM events e JOIN deliveries d ON d.event_pk = e.id"
         " AND d.destination = 'google' AND d.status != 'skipped' WHERE e.received_at >= ?",
-        (start,),
+        (w.start,),
     )
     meta_keys = Counter(k for r in meta_rows for k in r["meta_keys"].split(",") if k)
     google_keys = [set(filter(None, r["google_keys"].split(","))) for r in google_rows]
@@ -208,13 +220,14 @@ def match_quality(store: Store, start: float, now: float, days: int) -> dict:
     scores = [r["meta_score"] for r in meta_rows]
     by_day: dict[str, list[float]] = defaultdict(list)
     for r in meta_rows:
-        by_day[_day(r["received_at"])].append(r["meta_score"])
+        by_day[w.day(r["received_at"])].append(r["meta_score"])
     bands = Counter(quality.meta_rating(s) for s in scores)
+    average = sum(scores) / len(scores) if scores else None
     return {
         "meta": {
             "events": len(meta_rows),
-            "score": round(sum(scores) / len(scores), 1) if scores else None,
-            "rating": quality.meta_rating(sum(scores) / len(scores)) if scores else None,
+            "score": round(average, 1) if average is not None else None,
+            "rating": quality.meta_rating(average) if average is not None else None,
             "bands": {band: bands[band] for band in ("Great", "Good", "OK", "Poor")},
             "keys": [
                 {"key": key, "label": label, "coverage": pct(meta_keys[key], len(meta_rows))}
@@ -222,7 +235,7 @@ def match_quality(store: Store, start: float, now: float, days: int) -> dict:
             ],
             "daily": [
                 {"day": day, "score": round(sum(by_day[day]) / len(by_day[day]), 2) if by_day[day] else None}
-                for day in _days(now, days)
+                for day in w.days
             ],
         },
         "google": {
@@ -237,29 +250,30 @@ def match_quality(store: Store, start: float, now: float, days: int) -> dict:
     }
 
 
-def platform_quality(store: Store, start: float) -> dict:
+def platform_quality(store: Store, w: Window) -> dict:
     """What the platforms say: Meta's latest Dataset Quality snapshot; Google's processing results."""
     meta = None
     if snapshot := store.latest_snapshot("meta"):
         taken_at, data = snapshot
         meta = {"taken_at": taken_at, "events": [_meta_event(row) for row in data.get("events", {}).values()]}
-    statuses = Counter()
+    statuses: Counter = Counter()
     errors: Counter = Counter()
     warnings: Counter = Counter()
     records = 0
     for row in store.all(
         "SELECT processing_status, diagnostics, event_count FROM requests"
         " WHERE destination = 'google' AND ok = 1 AND started_at >= ?",
-        (start,),
+        (w.start,),
     ):
         statuses[row["processing_status"] or "VALIDATE_ONLY"] += 1
         records += row["event_count"]
         diagnostics = json.loads(row["diagnostics"]) if row["diagnostics"] else {}
         for e in diagnostics.get("errors", []):
             errors[e["reason"]] += e["count"]
-        for w in diagnostics.get("warnings", []):
-            warnings[w["reason"]] += w["count"]
-    rejected = sum(errors.values())
+        for warning in diagnostics.get("warnings", []):
+            warnings[warning["reason"]] += warning["count"]
+    # A repeated transaction ID means Google already has the conversion: not a loss.
+    rejected = sum(n for reason, n in errors.items() if reason not in ALREADY_RECORDED)
     google = {
         "requests": dict(statuses),
         "records": records,
@@ -302,18 +316,16 @@ def _meta_event(row: dict) -> dict:
     }
 
 
-def attribution(store: Store, event_name: str, now: float, days: int) -> dict:
+def attribution(store: Store, event_name: str, w: Window) -> dict:
     """Orders by the relay's last-click channel against what Meta and Google each report."""
-    day_list = _days(now, days)
-    first, last = day_list[0], day_list[-1]
-    start = datetime.fromisoformat(first).replace(tzinfo=timezone.utc).timestamp()
+    first, last = w.days[0], w.days[-1]
     internal: dict[tuple[str, str], list[float]] = defaultdict(lambda: [0, 0.0])
     campaigns_internal: dict[tuple[str, str], list[float]] = defaultdict(lambda: [0, 0.0])
     for row in store.all(
         "SELECT event_time, channel, campaign, value FROM events WHERE event_name = ? AND event_time >= ?",
-        (event_name, start),
+        (event_name, w.start),
     ):
-        day = _day(row["event_time"])
+        day = w.day(row["event_time"])
         if day > last:
             continue
         for key in ((day, row["channel"]), (day, "all")):
@@ -343,16 +355,16 @@ def attribution(store: Store, event_name: str, now: float, days: int) -> dict:
             "meta_reported": reported[(day, "meta")][0],
             "google_reported": reported[(day, "google")][0],
         }
-        for day in day_list
+        for day in w.days
     ]
     orders = sum(d["orders"] for d in daily)
-    revenue = sum(internal[(day, "all")][1] for day in day_list)
+    revenue = sum(internal[(day, "all")][1] for day in w.days)
     platforms = {}
     for platform in ("meta", "google"):
-        conversions = sum(internal[(day, platform)][0] for day in day_list)
-        value = sum(internal[(day, platform)][1] for day in day_list)
-        claimed = sum(reported[(day, platform)][0] for day in day_list)
-        claimed_value = sum(reported[(day, platform)][1] for day in day_list)
+        conversions = sum(internal[(day, platform)][0] for day in w.days)
+        value = sum(internal[(day, platform)][1] for day in w.days)
+        claimed = sum(reported[(day, platform)][0] for day in w.days)
+        claimed_value = sum(reported[(day, platform)][1] for day in w.days)
         platforms[platform] = {
             "internal": conversions,
             "internal_value": round(value, 2),
@@ -364,14 +376,13 @@ def attribution(store: Store, event_name: str, now: float, days: int) -> dict:
     claims = platforms["meta"]["reported"] + platforms["google"]["reported"]
     # What Meta and Google claim together, against what the last click gives the two of them.
     paid = platforms["meta"]["internal"] + platforms["google"]["internal"]
-    fetched = store.scalar("SELECT MAX(fetched_at) FROM platform_reports")
     return {
         "event_name": event_name,
         "first_day": first,
         "last_day": last,
         "orders": orders,
         "revenue": round(revenue, 2),
-        "by_channel": {c: sum(internal[(day, c)][0] for day in day_list) for c in CHANNELS},
+        "by_channel": {c: sum(internal[(day, c)][0] for day in w.days) for c in CHANNELS},
         "platforms": platforms,
         "claims": round(claims, 2),
         "claims_vs_orders": round(claims / orders, 2) if orders else None,
@@ -379,7 +390,7 @@ def attribution(store: Store, event_name: str, now: float, days: int) -> dict:
         "claims_vs_internal": round(claims / paid, 2) if paid else None,
         "daily": daily,
         "campaigns": _campaigns(campaigns_internal, campaigns_reported),
-        "reports_fetched_at": fetched,
+        "reports_fetched_at": store.scalar("SELECT MAX(fetched_at) FROM platform_reports"),
     }
 
 
