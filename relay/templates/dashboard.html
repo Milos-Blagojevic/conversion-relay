@@ -166,6 +166,7 @@
         <tr><td>Records accepted after processing</td><td class="num">{{ g.accepted_rate | pct }} of {{ g.records | num }}</td></tr>
         {% for reason, n in g.errors %}<tr><td class="bad small">{{ reason | replace('PROCESSING_ERROR_REASON_', '') | lower | replace('_', ' ') }}</td><td class="num">{{ n }}</td></tr>{% endfor %}
         {% for reason, n in g.warnings %}<tr><td class="warn small">{{ reason | replace('PROCESSING_WARNING_REASON_', '') | lower | replace('_', ' ') }}</td><td class="num">{{ n }}</td></tr>{% endfor %}
+        {% if g.already_recorded %}<tr><td class="muted small" title="A resend after a timeout: Google already holds these conversions">already recorded (repeated transaction ID)</td><td class="num">{{ g.already_recorded }}</td></tr>{% endif %}
       </table>
       <p class="muted small">Google reports no match score per event; customer-data coverage and processing errors are what the API exposes.
         Status is checked 30 minutes after each request, as Google recommends.</p>

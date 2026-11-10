@@ -91,12 +91,15 @@ the shop are safe. `POST /v1/events/batch` takes `{"events": [...]}` (up to 500)
 |---|---|
 | `event_id` | Dedup key. Meta: `event_id`, must equal the Pixel's `eventID`. Use the order id. |
 | `order_id` | Google `transactionId`, must equal the Google tag's `transaction_id`. Defaults to `event_id`. |
+| `event_source_url` | The page the conversion happened on. Meta requires it, with `user.user_agent`, for website events. |
 | `user.*` | Raw customer data; the relay normalises and hashes it per platform and never stores it. `client_ip`, `user_agent`, `fbp` and `fbc` are sent unhashed, as both platforms require. |
 | `click` | The last ad click the site saw (keep click ids and UTMs in a first-party cookie at landing). Feeds Google's `gclid`/`gbraid`/`wbraid`, Meta's `fbc` (built from `fbclid` when the cookie is missing), and the internal attribution. `utm_id` lets the dashboard join campaigns by id. |
 | `consent.ad_user_data` | `false`: nothing is sent to either platform (counted as skipped). Missing: sent, without a consent signal. |
 
-What each platform gets: Meta, every event (website events need `user_agent`); Google, the events
-named in `GOOGLE_EVENTS` (default `Purchase`) that carry customer data, a click id or an IP address.
+What each platform gets: Meta, every website event with `user_agent` and `event_source_url`, and events
+with other `action_source` values except `app` (app events need device data the relay does not take);
+Google, the events named in `GOOGLE_EVENTS` (default `Purchase`) that carry customer data, a click id or
+an IP address. Anything left out is recorded as `skipped` with the reason, and shows on the dashboard.
 
 ### Browser: share the keys, post a beacon
 

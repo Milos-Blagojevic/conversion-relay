@@ -259,25 +259,34 @@ def platform_quality(store: Store, w: Window) -> dict:
     statuses: Counter = Counter()
     errors: Counter = Counter()
     warnings: Counter = Counter()
-    records = 0
+    already_recorded = records = 0
     for row in store.all(
         "SELECT processing_status, diagnostics, event_count FROM requests"
         " WHERE destination = 'google' AND ok = 1 AND started_at >= ?",
         (w.start,),
     ):
-        statuses[row["processing_status"] or "VALIDATE_ONLY"] += 1
         records += row["event_count"]
         diagnostics = json.loads(row["diagnostics"]) if row["diagnostics"] else {}
+        real = 0
         for e in diagnostics.get("errors", []):
-            errors[e["reason"]] += e["count"]
+            # A repeated transaction ID means Google already has the conversion: not a loss.
+            if e["reason"] in ALREADY_RECORDED:
+                already_recorded += e["count"]
+            else:
+                errors[e["reason"]] += e["count"]
+                real += e["count"]
         for warning in diagnostics.get("warnings", []):
             warnings[warning["reason"]] += warning["count"]
-    # A repeated transaction ID means Google already has the conversion: not a loss.
-    rejected = sum(n for reason, n in errors.items() if reason not in ALREADY_RECORDED)
+        status = row["processing_status"] or "VALIDATE_ONLY"
+        if status in ("PARTIAL_SUCCESS", "FAILED") and not real:
+            status = "SUCCESS"
+        statuses[status] += 1
+    rejected = sum(errors.values())
     google = {
         "requests": dict(statuses),
         "records": records,
         "rejected": rejected,
+        "already_recorded": already_recorded,
         "accepted_rate": pct(records - rejected, records),
         "errors": errors.most_common(),
         "warnings": warnings.most_common(),
