@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% set nav = 'events' %}
+{% block title %}Events · conversion-relay{% endblock %}
+{% block main %}
+<div class="page-head">
+  <h1>Events</h1>
+  <span class="muted small">latest {{ rows | length }} · times in UTC · customer data is stored hashed and dropped once sent</span>
+</div>
+<div class="card">
+  <table>
+    <tr><th>Received</th><th>Event</th><th>event_id</th><th class="num">Value</th><th>Last click</th><th class="num">Est. EMQ</th><th>Match keys</th>
+      {% for name in destinations %}<th>{{ name | capitalize }}</th>{% endfor %}</tr>
+    {% for e in rows %}
+    {% set keys = e.meta_keys.split(',') if e.meta_keys else [] %}
+    <tr>
+      <td class="small">{{ e.received_at | when }}{% if e.duplicate_hits %}<div class="warn small">{{ e.duplicate_hits }} repeat{{ 's' if e.duplicate_hits > 1 }} ignored</div>{% endif %}</td>
+      <td>{{ e.event_name }}</td>
+      <td><code>{{ e.event_id }}</code></td>
+      <td class="num">{{ '%.2f' % e.value if e.value is not none else '–' }} {{ e.currency or '' }}</td>
+      <td class="small">{{ e.channel }}{% if e.campaign %}<div class="muted">{{ e.campaign }}</div>{% endif %}</td>
+      <td class="num rating-{{ rating(e.meta_score) }}">{{ e.meta_score }}</td>
+      <td class="small">{% for k in keys %}{{ labels.get(k, k) }}{{ ', ' if not loop.last }}{% endfor %}</td>
+      {% for name in destinations %}{% set d = deliveries.get(e.id, {}).get(name) %}
+      <td class="small">
+        {% if d %}
+        <span class="pill {{ 'ok' if d.status in ('sent', 'validated') else 'bad' if d.status in ('failed', 'rejected') else 'warn' if d.status == 'pending' else '' }}">{{ d.status }}</span>
+        {% if d.ms is not none %}<span class="muted">{{ d.ms | ms }}</span>{% endif %}
+        {% if d.attempts > 1 %}<span class="muted">· {{ d.attempts }} tries</span>{% endif %}
+        {% if d.reason %}<div class="muted">{{ d.reason }}</div>{% endif %}
+        {% else %}<span class="muted">n/a</span>{% endif %}
+      </td>
+      {% endfor %}
+    </tr>
+    {% else %}
+    <tr><td colspan="9" class="muted">No events yet. <code>POST /v1/events</code>{% if mode == 'sandbox' %}, place an order on the <a href="/demo">demo</a> page, or run <code>python -m relay seed</code>{% endif %}.</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}

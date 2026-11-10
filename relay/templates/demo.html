@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% set nav = 'demo' %}
+{% block title %}Demo · conversion-relay{% endblock %}
+{% block main %}
+<div class="page-head">
+  <h1>Deduplication demo</h1>
+  <span class="muted small">sandbox: Meta and Google are simulated in-process, the relay in between is the real one</span>
+</div>
+
+<div class="flow" style="margin-bottom:16px">
+  <span>1 · page fires Meta Pixel + Google tag</span>→<span>2 · page posts beacons to <code>/v1/beacons</code></span>→
+  <span>3 · shop backend posts <code>/v1/events</code></span>→<span>4 · relay sends to Conversions API + Data Manager API</span>→
+  <span>5 · each platform keeps one conversion per dedup key</span>
+</div>
+
+<div class="grid demo">
+  <form class="card" id="order-form">
+    <div class="field">
+      <label class="title">Dedup keys</label>
+      <div class="choice">
+        <label title="Pixel eventID = event_id = order id; Google tag transaction_id = transactionId; server forwards _fbp/_fbc"><input type="radio" name="scenario" value="shared" checked><span>Shared</span></label>
+        <label title="Pixel makes up its own eventID, the Google tag sends no transaction_id, the server forwards no cookies"><input type="radio" name="scenario" value="broken"><span>Broken</span></label>
+      </div>
+    </div>
+    <div class="field">
+      <label class="title">Ad journey before the order</label>
+      <div class="choice">
+        {% for s, label in [('meta_click', 'Meta click'), ('google_click', 'Google click'), ('both', 'Meta, then Google click'), ('meta_view', 'Meta view only'), ('direct', 'No ad')] %}
+        <label><input type="radio" name="source" value="{{ s }}" {{ 'checked' if loop.first }}><span>{{ label }}</span></label>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="field checks">
+      <label class="title">Browser</label>
+      <label><input type="checkbox" name="blocked"> Ad blocker (tags don't fire)</label>
+      <label><input type="checkbox" name="consent" checked> Consent to ad tracking</label>
+    </div>
+    <div class="field checks">
+      <label class="title">Customer data the shop has</label>
+      <label><input type="checkbox" name="email" checked> Email</label>
+      <label><input type="checkbox" name="phone"> Phone</label>
+    </div>
+    <div style="display:flex; gap:8px">
+      <button type="submit" class="primary">Place order</button>
+      <button type="button" id="burst">Place 10</button>
+    </div>
+    <p class="muted small" id="log" style="margin-top:10px"></p>
+  </form>
+
+  <div>
+    <div class="grid tally" style="margin-bottom:14px">
+      <div class="card kpi"><div class="label">Orders placed</div><div class="big" id="t-orders">0</div><div class="sub">this session</div></div>
+      <div class="card kpi"><div class="label">Meta counts</div><div class="big" id="t-meta">0</div><div class="sub" id="t-meta-sub"></div></div>
+      <div class="card kpi"><div class="label">Google counts</div><div class="big" id="t-google">0</div><div class="sub" id="t-google-sub"></div></div>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr><th>Order</th><th>Keys</th><th>Tags</th><th>Relay → Meta</th><th>Meta</th><th>Relay → Google</th><th>Google</th></tr></thead>
+        <tbody id="orders"><tr><td colspan="7" class="muted">Place an order to see where it lands.</td></tr></tbody>
+      </table>
+      <p class="muted small" style="margin-top:8px">Each chip is one hit a platform received: <span class="hit counted">counted</span>
+        <span class="hit dropped">dropped as duplicate</span>. Two counted chips for one order is the double count.</p>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}<script src="/static/demo.js"></script>{% endblock %}

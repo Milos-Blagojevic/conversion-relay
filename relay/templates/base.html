@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}conversion-relay{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/"><span class="brand-mark"></span>conversion-relay</a>
+    <nav class="nav">
+      <a href="/" class="{{ 'active' if nav == 'dashboard' }}">Dashboard</a>
+      <a href="/events" class="{{ 'active' if nav == 'events' }}">Events</a>
+      {% if mode == 'sandbox' %}<a href="/demo" class="{{ 'active' if nav == 'demo' }}">Demo</a>{% endif %}
+      <a href="/docs">API</a>
+    </nav>
+    <span class="spacer"></span>
+    {% if mode == 'sandbox' %}
+    <span class="badge sandbox" title="Meta and Google are simulated in-process; nothing leaves this machine">Sandbox</span>
+    {% else %}
+    <span class="badge" title="Events go to the real Meta and Google APIs">Live</span>
+    {% endif %}
+    <span class="muted small">{{ destinations | join(' · ') or 'no destinations configured' }}</span>
+  </header>
+  <main>{% block main %}{% endblock %}</main>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,268 @@
+{% extends "base.html" %}
+{% set nav = 'dashboard' %}
+{% block title %}Monitoring · conversion-relay{% endblock %}
+{% block main %}
+{% set a = m.attribution %}
+{% set pq = m.platform_quality %}
+{% set meta_events = pq.meta.events if pq.meta else [] %}
+{% set primary = (meta_events | selectattr('event_name', 'equalto', a.event_name) | list | first) or (meta_events | first) %}
+
+<div class="page-head">
+  <h1>Monitoring</h1>
+  <span class="muted small">last {{ days }} day{{ 's' if days > 1 }}</span>
+  <div class="controls">
+    <div class="seg">
+      {% for w in windows %}<a href="/?days={{ w }}" class="{{ 'active' if w == days }}">{{ w }}d</a>{% endfor %}
+    </div>
+    <form method="post" action="/api/monitor/refresh?days={{ days }}">
+      <button type="submit" title="Pull match quality, processing status and reported conversions from the platforms now">Refresh platform data</button>
+    </form>
+  </div>
+</div>
+
+<div class="flow small" style="margin-bottom:16px">
+  {% for run in m.monitor %}
+  <span title="{{ run.detail or '' }}"><b class="{{ 'ok' if run.ok else 'bad' }}">{{ '●' }}</b> {{ run.task | replace('_', ' ') }} · {{ run.ran_at | ago }}</span>
+  {% else %}
+  <span class="muted">Platform data not fetched yet{% if not destinations %} (no destination configured){% endif %}</span>
+  {% endfor %}
+</div>
+
+<div class="grid cards">
+  <div class="card kpi">
+    <div class="label">Events received</div>
+    <div class="value">{{ m.totals.events | num }}</div>
+    <div class="sub">{{ m.totals.duplicates_blocked | num }} repeat posts ignored · {{ m.totals.pending_now | num }} waiting</div>
+  </div>
+  {% for name in m.destinations %}{% set d = m.delivery[name] %}{% set l = m.latency[name] %}
+  <div class="card kpi">
+    <div class="label">{{ 'Meta Conversions API' if name == 'meta' else 'Google Data Manager' }} coverage</div>
+    <div class="value">{{ d.coverage | pct }}</div>
+    <div class="sub">p95 {{ l.p95_ms | ms }} · {{ d.statuses.get('failed', 0) + d.statuses.get('rejected', 0) }} failed · {{ d.statuses.get('skipped', 0) }} skipped</div>
+  </div>
+  {% endfor %}
+  {% if 'meta' in m.destinations %}
+  <div class="card kpi">
+    <div class="label">Meta event match quality</div>
+    {% if primary %}
+    <div class="value rating-{{ primary.rating }}">{{ primary.score }}<span class="muted small"> /10 {{ primary.rating }}</span></div>
+    {% else %}<div class="value muted">–</div>{% endif %}
+    <div class="sub">relay estimate {{ m.quality.meta.score if m.quality.meta.score is not none else '–' }} · {{ a.event_name }}</div>
+  </div>
+  {% endif %}
+  {% if 'google' in m.destinations %}
+  <div class="card kpi">
+    <div class="label">Google enhanced conversions</div>
+    <div class="value">{{ m.quality.google.user_data | pct }}</div>
+    <div class="sub">with customer data · {{ m.quality.google.click_id | pct }} with a click ID</div>
+  </div>
+  {% endif %}
+  <div class="card kpi">
+    <div class="label">Meta + Google claims ÷ last click</div>
+    <div class="value {{ 'warn' if (a.claims_vs_internal or 0) > 1.2 }}">{{ '%.2f×' % a.claims_vs_internal if a.claims_vs_internal is not none else '–' }}</div>
+    <div class="sub">{{ a.claims | num }} claimed vs {{ a.internal_paid | num }} by last click · {{ a.orders | num }} orders</div>
+  </div>
+</div>
+
+<section>
+  <div class="head"><h2>Deduplication: browser tags and server events</h2>
+    <p>From the beacons the page sends when its Meta Pixel and Google tag fire.</p></div>
+  {% set any_cov = m.coverage.meta_pixel or m.coverage.google_tag %}
+  {% if any_cov %}
+  <div class="grid two">
+    <div class="card">
+      <h3>Pairs by dedup key</h3>
+      <table>
+        <tr><th>Tag</th><th class="num">Tag fired</th><th class="num">Server events</th><th class="num">Matched pairs</th>
+            <th class="num" title="No tag fired: the server event is a conversion the browser lost">Server only</th>
+            <th class="num" title="The tag's key matches no server event: the platform counts the order twice, or the server never sent it">Tag only</th>
+            <th class="num">Key match</th></tr>
+        {% for tag, label in [('meta_pixel', 'Meta Pixel · eventID'), ('google_tag', 'Google tag · transaction_id')] %}
+        {% set c = m.coverage[tag] %}
+        {% if c %}
+        <tr><td>{{ label }}</td><td class="num">{{ c.browser | num }}</td><td class="num">{{ c.server | num }}</td>
+          <td class="num">{{ c.both | num }}</td><td class="num">{{ c.server_only | num }}<div class="muted small">{{ c.server_recovered | pct }}</div></td>
+          <td class="num {{ 'bad' if c.browser_only > 0 }}">{{ c.browser_only | num }}</td>
+          <td class="num {{ 'ok' if (c.key_match_rate or 0) >= 95 else 'bad' }}">{{ c.key_match_rate | pct }}</td></tr>
+        {% endif %}
+        {% endfor %}
+      </table>
+      <p class="note">A tag-only hit next to a server-only event is the same order counted twice: the two sides did not share the
+        key (Meta <code>eventID</code> = <code>event_id</code>, Google <code>transaction_id</code> = <code>transactionId</code>).</p>
+    </div>
+    <div class="card">
+      <h3>Daily key match rate</h3>
+      <div class="legend"><span><i class="c-meta"></i>Meta Pixel</span><span><i class="c-google"></i>Google tag</span></div>
+      <div class="series-mg">{{ charts.key_match }}</div>
+    </div>
+  </div>
+  {% else %}
+  <p class="note warn">No beacons yet. Have the page <code>POST /v1/beacons</code> (event id, event name, tag) when its tags fire
+    to see browser and server events side by side.</p>
+  {% endif %}
+  {% if primary and primary.dedup %}
+  <div class="card" style="margin-top:14px">
+    <h3>What Meta reports · {{ primary.event_name }} · event coverage {{ primary.coverage | pct }} (goal {{ primary.coverage_goal | pct }})</h3>
+    <table>
+      <tr><th>Dedup key</th><th class="num">Browser events with key</th><th class="num">Server events with key</th><th class="num">Browser events deduplicated through it</th></tr>
+      {% for d in primary.dedup %}
+      <tr><td><code>{{ d.key }}</code></td><td class="num">{{ d.browser | pct }}</td><td class="num">{{ d.server | pct }}</td><td class="num">{{ d.deduplicated | pct }}</td></tr>
+      {% endfor %}
+    </table>
+  </div>
+  {% endif %}
+</section>
+
+<section>
+  <div class="head"><h2>Event match quality</h2>
+    <p>Which customer keys each event carried, and what the platforms make of them.</p></div>
+  <div class="grid two">
+    {% if 'meta' in m.destinations %}
+    <div class="card">
+      <h3>Meta</h3>
+      {% if meta_events %}
+      <table style="margin-bottom:12px">
+        <tr><th>Event</th><th class="num">EMQ</th><th>Rating</th><th class="num">Coverage</th><th>Freshness</th><th class="num">&gt;2 h late</th><th class="num">ACR</th></tr>
+        {% for e in meta_events %}
+        <tr><td>{{ e.event_name }}</td><td class="num">{{ e.score }}</td><td class="rating-{{ e.rating }}">{{ e.rating }}</td>
+          <td class="num">{{ e.coverage | pct }}</td><td>{{ (e.freshness or '–') | replace('_', ' ') }}</td>
+          <td class="num">{{ e.delayed_2h | pct }}</td><td class="num" title="Additional conversions reported thanks to the Conversions API">{{ e.acr | pct }}</td></tr>
+        {% endfor %}
+      </table>
+      <p class="muted small">Dataset Quality API, last 7 days · fetched {{ pq.meta.taken_at | ago }}</p>
+      {% for e in meta_events %}{% for d in e.diagnostics %}
+      <p class="note warn"><b>{{ d.name }}</b> · {{ d.percentage | pct }} of {{ e.event_name }} events. {{ d.description }}</p>
+      {% endfor %}{% endfor %}
+      {% else %}
+      <p class="muted">No Dataset Quality snapshot yet.</p>
+      {% endif %}
+      <table>
+        <tr><th>Key</th><th>Sent by the relay</th><th class="num"></th><th class="num">Meta sees{% if primary %} ({{ primary.event_name }}, 7 days){% endif %}</th></tr>
+        {% for k in m.quality.meta['keys'] %}
+        <tr><td>{{ k.label }}</td><td><div class="bar"><span style="width:{{ k.coverage or 0 }}%"></span></div></td>
+          <td class="num">{{ k.coverage | pct }}</td>
+          <td class="num">{{ (primary['keys'].get(identifiers[k.key]) if primary else none) | pct }}</td></tr>
+        {% endfor %}
+      </table>
+      <h3 style="margin-top:16px">Relay estimate per day (0–10)</h3>
+      <div class="series-meta">{{ charts.score }}</div>
+      <p class="muted small">The estimate weighs the keys each event carried; Meta's EMQ above is the score that counts.
+        {{ m.quality.meta.bands.Great }} great · {{ m.quality.meta.bands.Good }} good · {{ m.quality.meta.bands.OK }} ok · {{ m.quality.meta.bands.Poor }} poor events.</p>
+    </div>
+    {% endif %}
+    {% if 'google' in m.destinations %}
+    {% set g = pq.google %}
+    <div class="card">
+      <h3>Google</h3>
+      <table style="margin-bottom:12px">
+        <tr><th>Identifier</th><th>Share of events</th><th class="num"></th></tr>
+        {% for k in m.quality.google['keys'] %}
+        <tr><td>{{ k.label }}</td><td><div class="bar"><span style="width:{{ k.coverage or 0 }}%"></span></div></td><td class="num">{{ k.coverage | pct }}</td></tr>
+        {% endfor %}
+      </table>
+      <h3>Processing (Data Manager diagnostics)</h3>
+      <table>
+        <tr><td>Requests</td><td class="num">{% for status, n in g.requests.items() %}<span class="pill {{ 'ok' if status == 'SUCCESS' else 'bad' if status in ('FAILED', 'PARTIAL_SUCCESS') else '' }}">{{ status | lower | replace('_', ' ') }} {{ n }}</span> {% else %}–{% endfor %}</td></tr>
+        <tr><td>Records accepted after processing</td><td class="num">{{ g.accepted_rate | pct }} of {{ g.records | num }}</td></tr>
+        {% for reason, n in g.errors %}<tr><td class="bad small">{{ reason | replace('PROCESSING_ERROR_REASON_', '') | lower | replace('_', ' ') }}</td><td class="num">{{ n }}</td></tr>{% endfor %}
+        {% for reason, n in g.warnings %}<tr><td class="warn small">{{ reason | replace('PROCESSING_WARNING_REASON_', '') | lower | replace('_', ' ') }}</td><td class="num">{{ n }}</td></tr>{% endfor %}
+      </table>
+      <p class="muted small">Google reports no match score per event; customer-data coverage and processing errors are what the API exposes.
+        Status is checked 30 minutes after each request, as Google recommends.</p>
+    </div>
+    {% endif %}
+  </div>
+</section>
+
+<section>
+  <div class="head"><h2>Latency</h2><p>From the relay receiving an event to the platform accepting it, retries included.</p></div>
+  <div class="grid two">
+    <div class="card">
+      <table>
+        <tr><th></th><th class="num">p50</th><th class="num">p95</th><th class="num">p99</th><th class="num">max</th><th class="num">API p95</th><th class="num">API errors</th><th class="num">&gt;2 h</th><th class="num">&gt;24 h</th></tr>
+        {% for name in m.destinations %}{% set l = m.latency[name] %}
+        <tr><td>{{ name | capitalize }}</td><td class="num">{{ l.p50_ms | ms }}</td><td class="num">{{ l.p95_ms | ms }}</td>
+          <td class="num">{{ l.p99_ms | ms }}</td><td class="num">{{ l.max_ms | ms }}</td><td class="num">{{ l.request_p95_ms | ms }}</td>
+          <td class="num">{{ l.request_error_rate | pct }}</td><td class="num">{{ l.over_2h | pct }}</td><td class="num">{{ l.over_24h | pct }}</td></tr>
+        {% endfor %}
+      </table>
+      <p class="muted small" style="margin-top:8px">&gt;2 h and &gt;24 h: events that reached the platform that long after they happened (late server events lose attribution).</p>
+    </div>
+    <div class="card">
+      <h3>p95 per day</h3>
+      <div class="legend"><span><i class="c-meta"></i>Meta</span><span><i class="c-google"></i>Google</span></div>
+      <div class="series-mg">{{ charts.latency }}</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="head"><h2>Delivery coverage</h2><p>Share of received events each platform got from the server.</p></div>
+  <div class="card">
+    <table>
+      <tr><th></th><th class="num">Events</th><th class="num">Sent</th><th class="num">Waiting</th><th class="num">Failed</th><th class="num">Rejected</th><th class="num">Skipped</th><th class="num">Retried</th><th class="num">Delivery rate</th><th class="num">Coverage</th><th>Why not sent</th></tr>
+      {% for name in m.destinations %}{% set d = m.delivery[name] %}
+      <tr><td>{{ name | capitalize }}</td><td class="num">{{ d.total | num }}</td>
+        <td class="num">{{ (d.statuses.get('sent', 0) + d.statuses.get('validated', 0)) | num }}</td>
+        <td class="num">{{ d.statuses.get('pending', 0) | num }}</td><td class="num">{{ d.statuses.get('failed', 0) | num }}</td>
+        <td class="num">{{ d.statuses.get('rejected', 0) | num }}</td><td class="num">{{ d.statuses.get('skipped', 0) | num }}</td>
+        <td class="num">{{ d.retried | num }}</td><td class="num">{{ d.delivery_rate | pct }}</td><td class="num">{{ d.coverage | pct }}</td>
+        <td class="small">{% for reason, n in d.reasons %}<div>{{ n }} × {{ reason }}</div>{% endfor %}</td></tr>
+      {% endfor %}
+    </table>
+    <p class="muted small" style="margin-top:8px">Delivery rate leaves out skipped events (no consent, no identifiers); coverage counts them.</p>
+  </div>
+</section>
+
+<section>
+  <div class="head"><h2>Attribution: internal vs platform-reported</h2>
+    <p>{{ a.event_name }} conversions, {{ a.first_day }} to {{ a.last_day }} (UTC, by conversion date).</p></div>
+  <div class="grid two">
+    <div class="card">
+      <table>
+        <tr><th></th><th class="num">Internal (last click)</th><th class="num">Platform reports</th><th class="num">Ratio</th><th class="num">Internal revenue</th><th class="num">Reported revenue</th></tr>
+        {% for p in ['meta', 'google'] %}{% set x = a.platforms[p] %}
+        <tr><td>{{ p | capitalize }}</td><td class="num">{{ x.internal | num }}</td><td class="num">{{ x.reported | num }}</td>
+          <td class="num {{ 'warn' if (x.ratio or 0) > 1.3 }}">{{ '%.2f×' % x.ratio if x.ratio is not none else '–' }}</td>
+          <td class="num">{{ x.internal_value | num }}</td><td class="num">{{ x.reported_value | num }}</td></tr>
+        {% endfor %}
+        <tr><td>Other / direct</td><td class="num">{{ a.by_channel.other | num }} / {{ a.by_channel.direct | num }}</td><td colspan="4"></td></tr>
+        <tr><td><b>All orders</b></td><td class="num"><b>{{ a.orders | num }}</b></td><td class="num"><b>{{ a.claims | num }}</b></td>
+          <td class="num">{{ '%.2f×' % a.claims_vs_orders if a.claims_vs_orders is not none else '–' }}</td><td class="num">{{ a.revenue | num }}</td><td></td></tr>
+      </table>
+      <p class="note">Internal: one channel per order, the last ad click the site saw within the lookback. Each platform instead
+        credits every conversion it can match to its own last click or view (Meta: 7-day click, 1-day view; Google: its click window),
+        so the two together can claim more conversions than there were orders, and duplicate browser + server events inflate them further.</p>
+      <p class="muted small">Platform reports fetched {{ a.reports_fetched_at | ago }}.</p>
+    </div>
+    <div class="card">
+      <h3>Orders vs Meta + Google claims per day</h3>
+      <div class="legend"><span><i class="c-internal"></i>Orders</span><span><i class="c-accent"></i>Meta + Google claims</span></div>
+      {{ charts.orders }}
+    </div>
+    <div class="card">
+      <h3>Meta per day</h3>
+      <div class="legend"><span><i class="c-internal"></i>Internal last click</span><span><i class="c-meta"></i>Meta reports</span></div>
+      <div class="chart meta">{{ charts.meta_attribution }}</div>
+    </div>
+    <div class="card">
+      <h3>Google per day</h3>
+      <div class="legend"><span><i class="c-internal"></i>Internal last click</span><span><i class="c-google"></i>Google reports</span></div>
+      <div class="chart google">{{ charts.google_attribution }}</div>
+    </div>
+  </div>
+  {% if a.campaigns %}
+  <div class="card" style="margin-top:14px">
+    <h3>Campaigns</h3>
+    <table>
+      <tr><th>Platform</th><th>Campaign</th><th class="num">Internal</th><th class="num">Reported</th><th class="num">Ratio</th></tr>
+      {% for c in a.campaigns %}
+      <tr><td>{{ c.platform | capitalize }}</td><td>{{ c.campaign }}</td><td class="num">{{ c.internal | num }}</td><td class="num">{{ c.reported | num }}</td>
+        <td class="num">{{ '%.2f×' % c.ratio if c.ratio is not none else '–' }}</td></tr>
+      {% endfor %}
+    </table>
+    <p class="muted small">Joined on the campaign id the site passes as <code>utm_id</code>, else on the campaign name.</p>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}
